@@ -1,26 +1,67 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/* =========================================================
+   BASYA ENGLISH OLYMPIA — Design tokens
+   Brand: Deep Purple #28204F · Primary Purple #7957E8
+          Lavender #EDE7FF · Champagne Gold #E5C779 · White
+   ========================================================= */
+@theme {
+  --color-ink: #28204f;          /* Deep Purple — headings, dark surfaces */
+  --color-ink-soft: #3a3166;
+  --color-brand: #7957e8;        /* Primary Purple — actions, links */
+  --color-brand-600: #6543d6;
+  --color-brand-700: #5232bd;
+  --color-lavender: #ede7ff;     /* Lavender — tints, highlights */
+  --color-lavender-50: #f8f5ff;
+  --color-gold: #e5c779;         /* Champagne Gold — achievements */
+  --color-gold-600: #b8963f;
+  --color-gold-50: #fbf6e6;
+  --color-surface: #fbfaff;      /* page background */
+  --color-line: #e6e0f7;         /* borders */
+  --color-muted: #615a85;        /* secondary text */
+  --color-success: #17865c;
+  --color-success-50: #e7f6ef;
+  --color-danger: #c93a4c;
+  --color-danger-50: #fcebed;
+  --color-warning: #b7791f;
+  --color-warning-50: #fdf3e2;
+
+  --font-sans: var(--font-jakarta), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-fraunces), ui-serif, Georgia, serif;
+
+  --radius-card: 1.25rem;
+  --shadow-soft: 0 1px 2px rgb(40 32 79 / 0.04), 0 8px 24px -12px rgb(40 32 79 / 0.14);
+  --shadow-lift: 0 2px 4px rgb(40 32 79 / 0.05), 0 18px 40px -18px rgb(40 32 79 / 0.28);
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  -webkit-text-size-adjust: 100%;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+}
+
+/* Reusable decorative background for hero areas */
+.bg-hero {
+  background:
+    radial-gradient(60rem 30rem at 85% -10%, rgb(121 87 232 / 0.35), transparent 60%),
+    radial-gradient(40rem 24rem at -10% 110%, rgb(229 199 121 / 0.22), transparent 60%),
+    var(--color-ink);
+}
+.bg-dots {
+  background-image: radial-gradient(rgb(121 87 232 / 0.16) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
 }

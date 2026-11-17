@@ -1,0 +1,623 @@
+-- =====================================================================
+-- BASYA ENGLISH OLYMPIA — Secure quiz engine, scoring & gamification
+-- Students never read questions/options tables directly. Everything flows
+-- through these SECURITY DEFINER functions, which decide what to reveal.
+-- =====================================================================
+
+-- ---------- Internal: create an attempt from a list of question ids ----------
+create or replace function public._build_attempt(
+  p_student uuid, p_title text, p_mode public.quiz_mode, p_type public.assessment_type,
+  p_learning_mode public.learning_mode, p_cefr public.cefr_level, p_school public.school_level,
+  p_category smallint, p_passing smallint, p_time_limit smallint,
+  p_package uuid, p_assignment uuid, p_question_ids uuid[]
+) returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  v_attempt uuid;
+begin
+  if coalesce(array_length(p_question_ids, 1), 0) = 0 then
+    raise exception 'NO_QUESTIONS' using hint = 'No published questions match this selection yet.';
+  end if;
+
+  insert into public.quiz_attempts (
+    student_id, package_id, assignment_id, title, mode, assessment_type, learning_mode,
+    cefr_level, school_level, category_id, passing_score, time_limit_minutes, expires_at, total_questions
+  ) values (
+    p_student, p_package, p_assignment, p_title, p_mode, p_type, p_learning_mode,
+    p_cefr, p_school, p_category, coalesce(p_passing, 70), p_time_limit,
+    case when p_time_limit is not null then now() + make_interval(mins => p_time_limit) end,
+    array_length(p_question_ids, 1)
+  ) returning id into v_attempt;
+
+  insert into public.attempt_questions (attempt_id, question_id, position, option_order)
+  select v_attempt, q.qid, q.ord::smallint,
+         array(select o.id from public.question_options o where o.question_id = q.qid order by random())
+  from unnest(p_question_ids) with ordinality as q(qid, ord);
+
+  return v_attempt;
+end;
+$$;
+revoke execute on function public._build_attempt from public, anon, authenticated;
+
+-- ---------- Internal: random published question ids for a filter ----------
+create or replace function public._pick_questions(
+  p_learning_mode public.learning_mode, p_cefr public.cefr_level, p_school public.school_level,
+  p_category smallint, p_difficulty public.difficulty_level, p_count int
+) returns uuid[] language sql volatile security definer set search_path = public as $$
+  select coalesce(array_agg(id), '{}') from (
+    select q.id from public.questions q
+    where q.status = 'published'
+      and q.learning_mode = p_learning_mode
+      and (p_cefr is null or q.cefr_level = p_cefr)
+      and (p_school is null or q.school_level is null or q.school_level = p_school)
+      and (p_category is null or q.category_id = p_category)
+      and (p_difficulty is null or q.difficulty = p_difficulty)
+      and (select count(*) from public.question_options o where o.question_id = q.id) >= 2
+    order by random()
+    limit greatest(1, least(p_count, 100))
+  ) s;
+$$;
+revoke execute on function public._pick_questions from public, anon, authenticated;
+
+-- ---------- Start an ad-hoc practice / quiz ----------
+create or replace function public.start_practice(
+  p_learning_mode public.learning_mode,
+  p_cefr public.cefr_level default null,
+  p_school_level public.school_level default null,
+  p_category_slug text default null,
+  p_difficulty public.difficulty_level default null,
+  p_count int default 10,
+  p_mode public.quiz_mode default 'practice',
+  p_time_limit int default null,
+  p_assessment_type public.assessment_type default 'daily_practice',
+  p_title text default null
+) returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  v_cat smallint;
+  v_cat_name text;
+  v_title text;
+begin
+  if auth.uid() is null then raise exception 'NOT_AUTHENTICATED'; end if;
+  if p_time_limit is not null and (p_time_limit < 1 or p_time_limit > 240) then
+    raise exception 'INVALID_TIME_LIMIT';
+  end if;
+
+  if p_category_slug is not null then
+    select id, name into v_cat, v_cat_name from public.question_categories where slug = p_category_slug;
+    if v_cat is null then raise exception 'UNKNOWN_CATEGORY'; end if;
+  end if;
+
+  v_title := coalesce(nullif(trim(p_title), ''),
+    concat_ws(' · ',
+      case p_learning_mode when 'olympiad' then coalesce(p_school_level::text || ' ', '') || 'Olympiad' else p_cefr::text end,
+      coalesce(v_cat_name, 'Mixed Skills'),
+      initcap(p_mode::text)));
+
+  return public._build_attempt(
+    auth.uid(), v_title, p_mode, p_assessment_type, p_learning_mode, p_cefr, p_school_level,
+    v_cat, 70::smallint, p_time_limit::smallint, null, null,
+    public._pick_questions(p_learning_mode, p_cefr, p_school_level, v_cat, p_difficulty, p_count)
+  );
+end;
+$$;
+
+-- ---------- Start a configured assessment package ----------
+create or replace function public.start_package_attempt(p_package_id uuid, p_assignment_id uuid default null)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  p public.quiz_packages;
+  v_ids uuid[];
+  v_lvl public.cefr_level;
+  v_per_level int;
+begin
+  if auth.uid() is null then raise exception 'NOT_AUTHENTICATED'; end if;
+  select * into p from public.quiz_packages where id = p_package_id;
+  if p.id is null or (p.status <> 'published' and not public.is_staff()) then
+    raise exception 'PACKAGE_NOT_AVAILABLE';
+  end if;
+  if p_assignment_id is not null and not exists (
+    select 1 from public.assignments a join public.enrollments e on e.class_id = a.class_id
+    where a.id = p_assignment_id and a.package_id = p_package_id and e.student_id = auth.uid()
+  ) then
+    raise exception 'ASSIGNMENT_NOT_AVAILABLE';
+  end if;
+
+  -- Fixed question list takes priority
+  select array_agg(qq.question_id order by
+           case when p.mode = 'exam' then random() else qq.position end)
+    into v_ids
+  from public.quiz_questions qq join public.questions q on q.id = qq.question_id
+  where qq.package_id = p.id and q.status = 'published';
+
+  if v_ids is null then
+    if p.assessment_type = 'diagnostic' and p.target_cefr is null then
+      -- Balanced placement test: equal share from every CEFR level
+      v_per_level := greatest(1, ceil(p.question_count / 4.0)::int);
+      v_ids := '{}';
+      foreach v_lvl in array enum_range(null::public.cefr_level) loop
+        v_ids := v_ids || public._pick_questions('proficiency', v_lvl, p.school_level, p.category_id, null, v_per_level);
+      end loop;
+    else
+      v_ids := public._pick_questions(p.learning_mode, p.target_cefr, p.school_level, p.category_id, null, p.question_count);
+    end if;
+  end if;
+
+  return public._build_attempt(
+    auth.uid(), p.title, p.mode, p.assessment_type, p.learning_mode, p.target_cefr, p.school_level,
+    p.category_id, p.passing_score, p.time_limit_minutes, p.id, p_assignment_id, v_ids
+  );
+end;
+$$;
+
+-- ---------- Internal: feedback object for one question ----------
+create or replace function public._question_feedback(p_question_id uuid, p_is_correct boolean)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object(
+    'is_correct', p_is_correct,
+    'correct_option_id', (select o.id from public.question_options o where o.question_id = q.id and o.is_correct),
+    'explanation', q.explanation,
+    'distractor_analysis', q.distractor_analysis,
+    'learning_objective', q.learning_objective,
+    'skill_assessed', q.skill_assessed
+  ) from public.questions q where q.id = p_question_id;
+$$;
+revoke execute on function public._question_feedback from public, anon, authenticated;
+
+-- ---------- Read an attempt (questions + only the feedback allowed right now) ----------
+create or replace function public.get_attempt(p_attempt_id uuid)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  a public.quiz_attempts;
+  v_reveal_all boolean;
+begin
+  select * into a from public.quiz_attempts where id = p_attempt_id;
+  if a.id is null or not public.can_view_student(a.student_id) then
+    raise exception 'ATTEMPT_NOT_FOUND';
+  end if;
+  v_reveal_all := a.status = 'submitted';
+
+  return jsonb_build_object(
+    'attempt', to_jsonb(a) || jsonb_build_object(
+      'server_now', now(),
+      'category_name', (select name from public.question_categories where id = a.category_id)),
+    'questions', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'id', q.id,
+        'code', q.code,
+        'position', aq.position,
+        'question_text', q.question_text,
+        'passage', q.passage,
+        'difficulty', q.difficulty,
+        'cefr_level', q.cefr_level,
+        'category', c.name,
+        'category_slug', c.slug,
+        'options', (
+          select jsonb_agg(jsonb_build_object('id', o.id, 'text', o.option_text) order by ord)
+          from unnest(aq.option_order) with ordinality as oo(oid, ord)
+          join public.question_options o on o.id = oo.oid
+        ),
+        'selected_option_id', sa.selected_option_id,
+        'feedback', case
+          when v_reveal_all then public._question_feedback(q.id, coalesce(sa.is_correct, false))
+          when a.mode = 'practice' and sa.id is not null then public._question_feedback(q.id, sa.is_correct)
+          else null end
+      ) order by aq.position)
+      from public.attempt_questions aq
+      join public.questions q on q.id = aq.question_id
+      join public.question_categories c on c.id = q.category_id
+      left join public.student_answers sa on sa.attempt_id = aq.attempt_id and sa.question_id = aq.question_id
+      where aq.attempt_id = a.id
+    ), '[]'::jsonb)
+  );
+end;
+$$;
+
+-- ---------- Save an answer ----------
+create or replace function public.answer_question(p_attempt_id uuid, p_question_id uuid, p_option_id uuid)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  a public.quiz_attempts;
+  v_correct boolean;
+  v_existing uuid;
+begin
+  select * into a from public.quiz_attempts where id = p_attempt_id for update;
+  if a.id is null or a.student_id <> auth.uid() then raise exception 'ATTEMPT_NOT_FOUND'; end if;
+  if a.status <> 'in_progress' then raise exception 'ATTEMPT_ALREADY_SUBMITTED'; end if;
+  if a.expires_at is not null and now() > a.expires_at + interval '15 seconds' then
+    raise exception 'TIME_IS_UP';
+  end if;
+  if not exists (select 1 from public.attempt_questions where attempt_id = a.id and question_id = p_question_id) then
+    raise exception 'QUESTION_NOT_IN_ATTEMPT';
+  end if;
+  select is_correct into v_correct from public.question_options where id = p_option_id and question_id = p_question_id;
+  if v_correct is null then raise exception 'INVALID_OPTION'; end if;
+
+  select id into v_existing from public.student_answers where attempt_id = a.id and question_id = p_question_id;
+
+  if a.mode = 'practice' then
+    -- Feedback is revealed immediately, so the first answer is final
+    if v_existing is not null then raise exception 'ALREADY_ANSWERED'; end if;
+    insert into public.student_answers (attempt_id, question_id, student_id, selected_option_id, is_correct)
+    values (a.id, p_question_id, auth.uid(), p_option_id, v_correct);
+    return jsonb_build_object('saved', true, 'feedback', public._question_feedback(p_question_id, v_correct));
+  end if;
+
+  insert into public.student_answers (attempt_id, question_id, student_id, selected_option_id, is_correct)
+  values (a.id, p_question_id, auth.uid(), p_option_id, v_correct)
+  on conflict (attempt_id, question_id) do update
+    set selected_option_id = excluded.selected_option_id, is_correct = excluded.is_correct, answered_at = now();
+  return jsonb_build_object('saved', true);   -- exam mode: never reveal correctness
+end;
+$$;
+
+-- ---------- Internal: award XP ----------
+create or replace function public._grant_xp(p_student uuid, p_amount int, p_reason text, p_source_type text, p_source_id text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if p_amount <= 0 then return; end if;
+  insert into public.xp_transactions (student_id, amount, reason, source_type, source_id)
+  values (p_student, p_amount, p_reason, p_source_type, p_source_id);
+  update public.profiles set xp = xp + p_amount where id = p_student;
+end;
+$$;
+revoke execute on function public._grant_xp from public, anon, authenticated;
+
+-- ---------- Internal: check & award achievements; returns newly earned badges ----------
+create or replace function public._award_achievements(p_student uuid)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_new jsonb := '[]'::jsonb;
+  r record;
+begin
+  for r in
+    select ach.* from public.achievements ach
+    where not exists (select 1 from public.student_achievements sa where sa.student_id = p_student and sa.achievement_id = ach.id)
+      and case ach.code
+        when 'first_step' then exists (select 1 from public.quiz_attempts where student_id = p_student and status = 'submitted')
+        when 'olympiad_fighter' then exists (select 1 from public.quiz_attempts where student_id = p_student and status = 'submitted' and learning_mode = 'olympiad')
+        when 'consistency_star' then (select current_streak from public.profiles where id = p_student) >= 7
+        when 'grammar_explorer' then public._correct_in_category(p_student, 'grammar') >= 20
+        when 'reading_champion' then public._correct_in_category(p_student, 'reading') >= 20
+        when 'vocabulary_master' then public._correct_in_category(p_student, 'vocabulary') >= 20
+        else false end
+  loop
+    insert into public.student_achievements (student_id, achievement_id) values (p_student, r.id);
+    perform public._grant_xp(p_student, r.xp_reward, 'Badge: ' || r.name, 'achievement', r.code);
+    v_new := v_new || jsonb_build_object('code', r.code, 'name', r.name, 'description', r.description, 'icon', r.icon, 'xp_reward', r.xp_reward);
+  end loop;
+  return v_new;
+end;
+$$;
+
+create or replace function public._correct_in_category(p_student uuid, p_slug text)
+returns int language sql stable security definer set search_path = public as $$
+  select count(*)::int from public.student_answers sa
+  join public.quiz_attempts a on a.id = sa.attempt_id and a.status = 'submitted'
+  join public.questions q on q.id = sa.question_id
+  join public.question_categories c on c.id = q.category_id
+  where sa.student_id = p_student and sa.is_correct and c.slug = p_slug;
+$$;
+revoke execute on function public._award_achievements from public, anon, authenticated;
+revoke execute on function public._correct_in_category from public, anon, authenticated;
+
+-- ---------- Submit & score ----------
+create or replace function public.submit_attempt(p_attempt_id uuid)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  a public.quiz_attempts;
+  v_correct int;
+  v_answered int;
+  v_score numeric(5, 2);
+  v_passed boolean;
+  v_xp int := 0;
+  v_today date := (now() at time zone 'Asia/Jakarta')::date;
+  v_prof public.profiles;
+  v_placement public.cefr_level;
+  v_lvl record;
+  v_badges jsonb;
+begin
+  select * into a from public.quiz_attempts where id = p_attempt_id for update;
+  if a.id is null or a.student_id <> auth.uid() then raise exception 'ATTEMPT_NOT_FOUND'; end if;
+  if a.status = 'submitted' then
+    return jsonb_build_object('already_submitted', true, 'score', a.score, 'correct', a.correct_count,
+      'total', a.total_questions, 'passed', a.passed, 'xp_earned', a.xp_earned, 'new_badges', '[]'::jsonb,
+      'placement', a.placement_result);
+  end if;
+
+  select count(*) filter (where is_correct), count(*) into v_correct, v_answered
+  from public.student_answers where attempt_id = a.id;
+
+  v_score := round(100.0 * v_correct / greatest(a.total_questions, 1), 2);
+  v_passed := v_score >= a.passing_score;
+
+  -- Diagnostic placement: highest level where this and all lower levels reach 60% accuracy
+  if a.assessment_type = 'diagnostic' then
+    v_placement := 'A1';
+    for v_lvl in
+      select q.cefr_level as lvl,
+             count(*) as total,
+             count(*) filter (where sa.is_correct) as correct
+      from public.attempt_questions aq
+      join public.questions q on q.id = aq.question_id
+      left join public.student_answers sa on sa.attempt_id = aq.attempt_id and sa.question_id = aq.question_id
+      where aq.attempt_id = a.id and q.cefr_level is not null
+      group by q.cefr_level order by q.cefr_level
+    loop
+      exit when v_lvl.correct::numeric / v_lvl.total < 0.6;
+      v_placement := v_lvl.lvl;
+    end loop;
+    update public.profiles set cefr_level = v_placement, cefr_placed_at = now() where id = a.student_id;
+  end if;
+
+  -- XP: 2 per correct answer, +10 for completing at least half, +10 for passing
+  v_xp := v_correct * 2
+        + case when v_answered * 2 >= a.total_questions then 10 else 0 end
+        + case when v_passed and v_answered > 0 then 10 else 0 end;
+
+  update public.quiz_attempts set
+    status = 'submitted', submitted_at = now(), correct_count = v_correct, score = v_score,
+    passed = v_passed, xp_earned = v_xp, placement_result = v_placement
+  where id = a.id;
+
+  perform public._grant_xp(a.student_id, v_xp, 'Completed: ' || a.title, 'attempt', a.id::text);
+
+  -- Daily streak (Indonesian Western Time)
+  select * into v_prof from public.profiles where id = a.student_id;
+  if v_prof.last_active_date is distinct from v_today then
+    update public.profiles set
+      current_streak = case when v_prof.last_active_date = v_today - 1 then current_streak + 1 else 1 end,
+      last_active_date = v_today
+    where id = a.student_id;
+    update public.profiles set longest_streak = greatest(longest_streak, current_streak) where id = a.student_id;
+  end if;
+
+  v_badges := public._award_achievements(a.student_id);
+
+  return jsonb_build_object('already_submitted', false, 'score', v_score, 'correct', v_correct,
+    'total', a.total_questions, 'answered', v_answered, 'passed', v_passed, 'xp_earned', v_xp,
+    'new_badges', v_badges, 'placement', v_placement);
+end;
+$$;
+
+-- ---------- Student analytics (real data only) ----------
+create or replace function public.get_student_stats(p_student_id uuid default null)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_student uuid := coalesce(p_student_id, auth.uid());
+begin
+  if v_student is null or not public.can_view_student(v_student) then raise exception 'NOT_AUTHORIZED'; end if;
+
+  return jsonb_build_object(
+    'totals', (
+      select jsonb_build_object(
+        'attempts', count(*),
+        'avg_score', round(avg(score), 1),
+        'best_score', max(score),
+        'passed', count(*) filter (where passed))
+      from public.quiz_attempts where student_id = v_student and status = 'submitted'),
+    'answers', (
+      select jsonb_build_object('answered', count(*), 'correct', count(*) filter (where sa.is_correct))
+      from public.student_answers sa join public.quiz_attempts a on a.id = sa.attempt_id
+      where sa.student_id = v_student and a.status = 'submitted'),
+    'by_level', coalesce((
+      select jsonb_agg(jsonb_build_object('level', lvl, 'answered', answered, 'correct', correct) order by lvl)
+      from (
+        select q.cefr_level as lvl, count(*) as answered, count(*) filter (where sa.is_correct) as correct
+        from public.student_answers sa
+        join public.quiz_attempts a on a.id = sa.attempt_id and a.status = 'submitted'
+        join public.questions q on q.id = sa.question_id
+        where sa.student_id = v_student and q.cefr_level is not null
+        group by q.cefr_level) s), '[]'::jsonb),
+    'by_category', coalesce((
+      select jsonb_agg(jsonb_build_object('slug', slug, 'name', name, 'answered', answered, 'correct', correct) order by sort_order)
+      from (
+        select c.slug, c.name, c.sort_order, count(*) as answered, count(*) filter (where sa.is_correct) as correct
+        from public.student_answers sa
+        join public.quiz_attempts a on a.id = sa.attempt_id and a.status = 'submitted'
+        join public.questions q on q.id = sa.question_id
+        join public.question_categories c on c.id = q.category_id
+        where sa.student_id = v_student
+        group by c.slug, c.name, c.sort_order) s), '[]'::jsonb),
+    'trend', coalesce((
+      select jsonb_agg(jsonb_build_object('id', id, 'title', title, 'score', score, 'submitted_at', submitted_at) order by submitted_at)
+      from (select id, title, score, submitted_at from public.quiz_attempts
+            where student_id = v_student and status = 'submitted'
+            order by submitted_at desc limit 12) t), '[]'::jsonb)
+  );
+end;
+$$;
+
+-- ---------- How many published questions exist (counts only, no content) ----------
+create or replace function public.get_question_availability()
+returns table (learning_mode public.learning_mode, cefr_level public.cefr_level,
+               school_level public.school_level, category_slug text, total bigint)
+language sql stable security definer set search_path = public as $$
+  select q.learning_mode, q.cefr_level, q.school_level, c.slug, count(*)
+  from public.questions q join public.question_categories c on c.id = q.category_id
+  where q.status = 'published' and auth.uid() is not null
+  group by 1, 2, 3, 4;
+$$;
+
+-- ---------- Students join a class with a code ----------
+create or replace function public.join_class(p_code text)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  c public.classes;
+begin
+  if auth.uid() is null then raise exception 'NOT_AUTHENTICATED'; end if;
+  select * into c from public.classes where join_code = upper(trim(p_code));
+  if c.id is null then raise exception 'INVALID_CLASS_CODE'; end if;
+  insert into public.enrollments (class_id, student_id) values (c.id, auth.uid()) on conflict do nothing;
+  return jsonb_build_object('class_id', c.id, 'name', c.name);
+end;
+$$;
+
+-- ---------- Admin: create/update a question with options & tags atomically ----------
+create or replace function public.admin_save_question(p jsonb)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := nullif(p ->> 'id', '')::uuid;
+  v_code text := nullif(trim(p ->> 'code'), '');
+  v_cat smallint;
+  v_correct text := upper(trim(p ->> 'correct_answer'));
+  v_label text;
+begin
+  if not public.is_admin() then raise exception 'NOT_AUTHORIZED'; end if;
+
+  select id into v_cat from public.question_categories
+  where slug = p ->> 'category' or lower(name) = lower(p ->> 'category');
+  if v_cat is null then raise exception 'UNKNOWN_CATEGORY: %', p ->> 'category'; end if;
+  if v_correct not in ('A', 'B', 'C', 'D') then raise exception 'INVALID_CORRECT_ANSWER'; end if;
+  if nullif(trim(p ->> ('option_' || lower(v_correct))), '') is null then
+    raise exception 'CORRECT_OPTION_IS_EMPTY';
+  end if;
+
+  -- Import by Question ID: update the existing question with that code
+  if v_id is null and v_code is not null then
+    select id into v_id from public.questions where code = v_code;
+  end if;
+
+  if v_id is null then
+    insert into public.questions (code, cefr_level, school_level, learning_mode, category_id, subcategory, difficulty,
+      question_text, passage, explanation, distractor_analysis, learning_objective, skill_assessed, status, created_by)
+    values (
+      coalesce(v_code, 'BEO-' || lpad(nextval('public.question_code_seq')::text, 5, '0')),
+      nullif(p ->> 'cefr_level', '')::public.cefr_level,
+      nullif(p ->> 'school_level', '')::public.school_level,
+      (p ->> 'learning_mode')::public.learning_mode,
+      v_cat, nullif(trim(p ->> 'subcategory'), ''),
+      coalesce(nullif(p ->> 'difficulty', ''), 'medium')::public.difficulty_level,
+      trim(p ->> 'question_text'), nullif(trim(p ->> 'passage'), ''),
+      coalesce(trim(p ->> 'explanation'), ''), nullif(trim(p ->> 'distractor_analysis'), ''),
+      nullif(trim(p ->> 'learning_objective'), ''), nullif(trim(p ->> 'skill_assessed'), ''),
+      coalesce(nullif(p ->> 'status', ''), 'draft')::public.publication_status, auth.uid())
+    returning id into v_id;
+  else
+    update public.questions set
+      code = coalesce(v_code, code),
+      cefr_level = nullif(p ->> 'cefr_level', '')::public.cefr_level,
+      school_level = nullif(p ->> 'school_level', '')::public.school_level,
+      learning_mode = (p ->> 'learning_mode')::public.learning_mode,
+      category_id = v_cat,
+      subcategory = nullif(trim(p ->> 'subcategory'), ''),
+      difficulty = coalesce(nullif(p ->> 'difficulty', ''), 'medium')::public.difficulty_level,
+      question_text = trim(p ->> 'question_text'),
+      passage = nullif(trim(p ->> 'passage'), ''),
+      explanation = coalesce(trim(p ->> 'explanation'), ''),
+      distractor_analysis = nullif(trim(p ->> 'distractor_analysis'), ''),
+      learning_objective = nullif(trim(p ->> 'learning_objective'), ''),
+      skill_assessed = nullif(trim(p ->> 'skill_assessed'), ''),
+      status = coalesce(nullif(p ->> 'status', ''), 'draft')::public.publication_status
+    where id = v_id;
+    if not found then raise exception 'QUESTION_NOT_FOUND'; end if;
+  end if;
+
+  -- Options: upsert by label so student answer history keeps pointing to the same option rows
+  update public.question_options set is_correct = false where question_id = v_id;
+  foreach v_label in array array['A', 'B', 'C', 'D'] loop
+    if nullif(trim(p ->> ('option_' || lower(v_label))), '') is null then
+      delete from public.question_options where question_id = v_id and label = v_label;
+    else
+      insert into public.question_options (question_id, label, option_text, is_correct)
+      values (v_id, v_label, trim(p ->> ('option_' || lower(v_label))), v_label = v_correct)
+      on conflict (question_id, label) do update
+        set option_text = excluded.option_text, is_correct = excluded.is_correct;
+    end if;
+  end loop;
+
+  if p ? 'tags' then
+    delete from public.question_tags where question_id = v_id;
+    insert into public.question_tags (question_id, tag)
+    select distinct v_id, lower(trim(t)) from unnest(string_to_array(p ->> 'tags', ',')) t
+    where trim(t) <> '';
+  end if;
+
+  return v_id;
+end;
+$$;
+
+-- ---------- Admin: bulk import (all-or-nothing) ----------
+create or replace function public.admin_import_questions(p_rows jsonb)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  r jsonb;
+  v_created int := 0;
+  v_updated int := 0;
+  v_exists boolean;
+  v_i int := 0;
+begin
+  if not public.is_admin() then raise exception 'NOT_AUTHORIZED'; end if;
+  if jsonb_array_length(p_rows) > 2000 then raise exception 'TOO_MANY_ROWS'; end if;
+  for r in select * from jsonb_array_elements(p_rows) loop
+    v_i := v_i + 1;
+    v_exists := nullif(trim(r ->> 'code'), '') is not null
+                and exists (select 1 from public.questions where code = trim(r ->> 'code'));
+    begin
+      perform public.admin_save_question(r);
+    exception when others then
+      raise exception 'Row %: %', v_i, sqlerrm;
+    end;
+    if v_exists then v_updated := v_updated + 1; else v_created := v_created + 1; end if;
+  end loop;
+  return jsonb_build_object('created', v_created, 'updated', v_updated);
+end;
+$$;
+
+-- ---------- Admin: change a user's role ----------
+create or replace function public.admin_set_user_role(p_user_id uuid, p_role text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_admin() then raise exception 'NOT_AUTHORIZED'; end if;
+  if p_user_id = auth.uid() and p_role <> 'admin' then raise exception 'CANNOT_DEMOTE_SELF'; end if;
+  update public.profiles set role = p_role where id = p_user_id;
+  if not found then raise exception 'USER_NOT_FOUND'; end if;
+end;
+$$;
+
+-- ---------- Admin overview (real counts) ----------
+create or replace function public.get_admin_overview()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.is_admin() then raise exception 'NOT_AUTHORIZED'; end if;
+  return jsonb_build_object(
+    'students', (select count(*) from public.profiles where role = 'student'),
+    'teachers', (select count(*) from public.profiles where role = 'teacher'),
+    'questions', (select count(*) from public.questions),
+    'published_questions', (select count(*) from public.questions where status = 'published'),
+    'published_packages', (select count(*) from public.quiz_packages where status = 'published'),
+    'classes', (select count(*) from public.classes),
+    'active_sessions', (select count(*) from public.quiz_attempts
+                        where status = 'in_progress' and started_at > now() - interval '2 hours'),
+    'submitted_attempts', (select count(*) from public.quiz_attempts where status = 'submitted'),
+    'avg_score', (select round(avg(score), 1) from public.quiz_attempts where status = 'submitted'),
+    'questions_by_category', coalesce((
+      select jsonb_agg(jsonb_build_object('name', c.name, 'total', (select count(*) from public.questions q where q.category_id = c.id)) order by c.sort_order)
+      from public.question_categories c), '[]'::jsonb),
+    'signups_by_week', coalesce((
+      select jsonb_agg(jsonb_build_object('week', wk, 'total', n) order by wk)
+      from (select date_trunc('week', created_at)::date as wk, count(*) as n
+            from public.profiles where created_at > now() - interval '12 weeks' group by 1) s), '[]'::jsonb)
+  );
+end;
+$$;
+
+-- Only signed-in users may call the public API functions
+revoke execute on function public.start_practice, public.start_package_attempt, public.get_attempt,
+  public.answer_question, public.submit_attempt, public.get_student_stats, public.get_question_availability,
+  public.join_class, public.admin_save_question, public.admin_import_questions, public.admin_set_user_role,
+  public.get_admin_overview from public, anon;
+grant execute on function public.start_practice, public.start_package_attempt, public.get_attempt,
+  public.answer_question, public.submit_attempt, public.get_student_stats, public.get_question_availability,
+  public.join_class, public.admin_save_question, public.admin_import_questions, public.admin_set_user_role,
+  public.get_admin_overview to authenticated;
+
+-- ---------- Default assessment packages (configurable by admin) ----------
+insert into public.quiz_packages (title, description, assessment_type, learning_mode, mode, question_count, time_limit_minutes, passing_score, status)
+values
+  ('BEO Placement Test', 'A balanced diagnostic across A1–B2 that places you at your real English level — not your school grade.',
+   'diagnostic', 'proficiency', 'exam', 20, 25, 60, 'published'),
+  ('SMP Olympiad Simulation', 'Timed Olympiad-style simulation for junior high school students.',
+   'olympiad_simulation', 'olympiad', 'exam', 20, 30, 70, 'published'),
+  ('SMA Olympiad Simulation', 'Timed Olympiad-style simulation for senior high school students.',
+   'olympiad_simulation', 'olympiad', 'exam', 25, 40, 70, 'published');
+update public.quiz_packages set school_level = 'SMP' where title = 'SMP Olympiad Simulation';
+update public.quiz_packages set school_level = 'SMA' where title = 'SMA Olympiad Simulation';
