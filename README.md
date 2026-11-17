@@ -94,7 +94,7 @@ Typography: **Fraunces** (elegant serif for headings) + **Plus Jakarta Sans** (c
 
 ## Running it
 
-### A. Connect to your own Supabase project (production or staging)
+### A. Publish it (Supabase + Vercel) — see **DEPLOY.md** for the beginner guide
 
 1. Create a free project at [supabase.com](https://supabase.com) (region: Singapore is closest to Indonesia).
 2. Apply the database schema (choose one):
